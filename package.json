@@ -6,12 +6,22 @@
   "type": "module",
   "scripts": {
     "start": "node get-flow-token.js",
-    "start:headless": "HEADLESS=true node get-flow-token.js",
-    "clear": "node get-flow-token.js --clear"
+    "all": "node get-flow-token.js --all",
+    "list": "node get-flow-token.js --list",
+    "clear": "node get-flow-token.js --clear",
+    "init": "node get-flow-token.js --accounts-init"
   },
-  "keywords": ["google", "flow", "bearer", "token", "automation"],
+  "keywords": [
+    "google",
+    "flow",
+    "bearer",
+    "token",
+    "automation"
+  ],
   "license": "MIT",
   "dependencies": {
-    "playwright": "^1.49.0"
+    "playwright": "^1.57.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }
