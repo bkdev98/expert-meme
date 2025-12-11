@@ -1,0 +1,17 @@
+{
+  "name": "flowkey-auto",
+  "version": "1.0.0",
+  "description": "Automatically extract Google Flow authorization bearer token",
+  "main": "get-flow-token.js",
+  "type": "module",
+  "scripts": {
+    "start": "node get-flow-token.js",
+    "start:headless": "HEADLESS=true node get-flow-token.js",
+    "clear": "node get-flow-token.js --clear"
+  },
+  "keywords": ["google", "flow", "bearer", "token", "automation"],
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
