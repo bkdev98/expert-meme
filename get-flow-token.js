@@ -3,9 +3,72 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import admin from 'firebase-admin';
 
 // Add stealth plugin to avoid detection
 chromium.use(StealthPlugin());
+
+// Firebase initialization (lazy)
+let firebaseInitialized = false;
+let db = null;
+
+function initFirebase() {
+  if (firebaseInitialized) return;
+
+  const serviceAccountPath = join(AUTH_DIR, 'firebase-service-account.json');
+
+  if (!existsSync(serviceAccountPath)) {
+    throw new Error(`Firebase service account not found at: ${serviceAccountPath}\nDownload it from Firebase Console > Project Settings > Service Accounts`);
+  }
+
+  const serviceAccount = JSON.parse(readFileSync(serviceAccountPath, 'utf-8'));
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+
+  db = admin.firestore();
+  firebaseInitialized = true;
+  console.log('Firebase initialized');
+}
+
+async function pushToFirestore(results, collection = 'flow_tokens') {
+  initFirebase();
+
+  const successful = results.filter(r => r.success);
+  if (successful.length === 0) {
+    console.log('No successful results to push to Firestore');
+    return { success: false, pushed: 0 };
+  }
+
+  console.log(`\nPushing ${successful.length} records to Firestore collection: ${collection}...`);
+
+  const batch = db.batch();
+  const timestamp = admin.firestore.FieldValue.serverTimestamp();
+
+  for (const r of successful) {
+    // Use email as document ID (sanitized)
+    const docId = r.email.replace(/@/g, '_at_').replace(/\./g, '_');
+    const docRef = db.collection(collection).doc(docId);
+
+    batch.set(docRef, {
+      email: r.email,
+      token: r.token,
+      credits: r.credits,
+      tier: r.tier,
+      updatedAt: timestamp,
+    }, { merge: true });
+  }
+
+  try {
+    await batch.commit();
+    console.log(`Successfully pushed ${successful.length} records to Firestore`);
+    return { success: true, pushed: successful.length };
+  } catch (e) {
+    console.log(`Firestore push failed: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
 
 const FLOW_URL = 'https://labs.google/fx/tools/flow';
 const API_PATTERN = /aisandbox-pa\.googleapis\.com/;
@@ -464,6 +527,7 @@ Google Flow Token Extractor
 Usage:
   node get-flow-token.js <email1> [email2] ...    Get tokens for emails
   node get-flow-token.js --all                    Get tokens for ALL accounts in accounts.json
+  node get-flow-token.js --daemon                 Run as daemon (daily at midnight)
   node get-flow-token.js --list                   List all saved tokens
   node get-flow-token.js --accounts-init          Create sample accounts.json
   node get-flow-token.js --refresh <email>        Force re-login for email
@@ -472,9 +536,12 @@ Usage:
 
 Options:
   --all                   Run all accounts from accounts.json (sequential)
+  --daemon                Run as background daemon, refresh daily at midnight
   --headless              Run in headless mode (only works if already logged in)
   --json                  Output tokens as JSON
   --submit <url>          Submit tokens to API endpoint
+  --firestore-push        Push results to Firestore
+  --firestore-collection  Firestore collection name (default: flow_tokens)
   --refresh               Force re-login (remove existing profile first)
   --list                  List all saved tokens
   --accounts-init         Create sample accounts.json file
@@ -514,10 +581,20 @@ Examples:
   # Output as JSON
   node get-flow-token.js --all --json
 
+  # Run as daemon (daily at midnight, headless)
+  node get-flow-token.js --daemon
+  node get-flow-token.js --daemon --submit https://api.example.com/tokens
+
+  # Push to Firestore
+  node get-flow-token.js --all --firestore-push
+  node get-flow-token.js --all --firestore-push --firestore-collection my_collection
+  node get-flow-token.js --daemon --firestore-push
+
 Files:
-  ~/.flowkey-auto/accounts.json   Email + password pairs (optional)
-  ~/.flowkey-auto/profiles/       Browser profiles per email
-  ~/.flowkey-auto/tokens.json     All captured tokens
+  ~/.flowkey-auto/accounts.json              Email + password pairs (optional)
+  ~/.flowkey-auto/profiles/                  Browser profiles per email
+  ~/.flowkey-auto/tokens.json                All captured tokens
+  ~/.flowkey-auto/firebase-service-account.json  Firebase service account (for --firestore-push)
 `);
   process.exit(0);
 }
@@ -560,11 +637,18 @@ if (args.includes('--all')) {
   const headless = args.includes('--headless');
   const forceLogin = args.includes('--refresh');
   const jsonOutput = args.includes('--json');
+  const firestorePush = args.includes('--firestore-push');
 
   let submitEndpoint = null;
   if (args.includes('--submit')) {
     const idx = args.indexOf('--submit');
     submitEndpoint = args[idx + 1];
+  }
+
+  let firestoreCollection = 'flow_tokens';
+  if (args.includes('--firestore-collection')) {
+    const idx = args.indexOf('--firestore-collection');
+    firestoreCollection = args[idx + 1];
   }
 
   const results = await processEmails(emails, { headless, forceLogin });
@@ -579,7 +663,111 @@ if (args.includes('--all')) {
     await submitToApi(submitEndpoint, results);
   }
 
+  if (firestorePush) {
+    await pushToFirestore(results, firestoreCollection);
+  }
+
   process.exit(0);
+}
+
+if (args.includes('--daemon')) {
+  // Run as daemon - executes daily at midnight
+  const submitEndpoint = args.includes('--submit') ? args[args.indexOf('--submit') + 1] : null;
+  const jsonOutput = args.includes('--json');
+  const firestorePush = args.includes('--firestore-push');
+  const firestoreCollection = args.includes('--firestore-collection')
+    ? args[args.indexOf('--firestore-collection') + 1]
+    : 'flow_tokens';
+
+  async function runDaily() {
+    // Always reload accounts.json fresh
+    if (!existsSync(ACCOUNTS_FILE)) {
+      console.log('No accounts.json found. Create one first:');
+      console.log('  node get-flow-token.js --accounts-init');
+      return;
+    }
+
+    let accounts = [];
+    try {
+      accounts = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf-8'));
+    } catch (e) {
+      console.log('Error reading accounts.json:', e.message);
+      return;
+    }
+
+    if (accounts.length === 0) {
+      console.log('No accounts in accounts.json');
+      return;
+    }
+
+    const emails = accounts.map(a => a.email);
+    const timestamp = new Date().toISOString();
+    console.log(`\n[${ timestamp }] Running daily token refresh for ${emails.length} accounts...`);
+
+    const results = await processEmails(emails, { headless: true, forceLogin: false });
+
+    if (jsonOutput) {
+      printTokensJson(results);
+    } else {
+      printResults(results);
+    }
+
+    if (submitEndpoint) {
+      await submitToApi(submitEndpoint, results);
+    }
+
+    if (firestorePush) {
+      await pushToFirestore(results, firestoreCollection);
+    }
+  }
+
+  function msUntilMidnight() {
+    const now = new Date();
+    const midnight = new Date(now);
+    midnight.setDate(midnight.getDate() + 1);
+    midnight.setHours(0, 0, 0, 0);
+    return midnight.getTime() - now.getTime();
+  }
+
+  function scheduleNextRun() {
+    const ms = msUntilMidnight();
+    const hours = Math.floor(ms / (1000 * 60 * 60));
+    const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+    console.log(`Next run scheduled in ${hours}h ${minutes}m (at midnight)`);
+
+    setTimeout(async () => {
+      await runDaily();
+      scheduleNextRun();
+    }, ms);
+  }
+
+  console.log('='.repeat(60));
+  console.log('DAEMON MODE - Running daily at midnight');
+  console.log('='.repeat(60));
+  console.log(`Accounts file: ${ACCOUNTS_FILE}`);
+  if (submitEndpoint) {
+    console.log(`Submit endpoint: ${submitEndpoint}`);
+  }
+  if (firestorePush) {
+    console.log(`Firestore collection: ${firestoreCollection}`);
+  }
+  console.log('');
+
+  // Run immediately on start
+  console.log('Running initial fetch...');
+  await runDaily();
+
+  // Schedule next run at midnight
+  scheduleNextRun();
+
+  // Keep process alive
+  process.on('SIGINT', () => {
+    console.log('\nDaemon stopped.');
+    process.exit(0);
+  });
+
+  // Prevent exit
+  await new Promise(() => {});
 }
 
 if (args.includes('--list')) {
@@ -626,6 +814,7 @@ if (args.includes('--remove')) {
 const headless = args.includes('--headless');
 const jsonOutput = args.includes('--json');
 const forceLogin = args.includes('--refresh');
+const firestorePush = args.includes('--firestore-push');
 
 let submitEndpoint = null;
 if (args.includes('--submit')) {
@@ -637,8 +826,14 @@ if (args.includes('--submit')) {
   }
 }
 
+let firestoreCollection = 'flow_tokens';
+if (args.includes('--firestore-collection')) {
+  const idx = args.indexOf('--firestore-collection');
+  firestoreCollection = args[idx + 1];
+}
+
 // Get emails (filter out flags and their values)
-const flagsWithValues = ['--submit', '--remove'];
+const flagsWithValues = ['--submit', '--remove', '--firestore-collection'];
 const emails = args.filter((arg, idx) => {
   if (arg.startsWith('--')) return false;
   const prevArg = args[idx - 1];
@@ -664,4 +859,9 @@ if (jsonOutput) {
 // Submit to API if requested
 if (submitEndpoint) {
   await submitToApi(submitEndpoint, results);
+}
+
+// Push to Firestore if requested
+if (firestorePush) {
+  await pushToFirestore(results, firestoreCollection);
 }

@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node get-flow-token.js",
     "all": "node get-flow-token.js --all",
+    "daemon": "node get-flow-token.js --daemon",
     "list": "node get-flow-token.js --list",
     "clear": "node get-flow-token.js --clear",
     "init": "node get-flow-token.js --accounts-init"
@@ -20,6 +21,7 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "firebase-admin": "^13.0.2",
     "playwright": "^1.57.0",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
